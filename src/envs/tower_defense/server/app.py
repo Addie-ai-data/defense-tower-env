@@ -52,21 +52,40 @@ class StepRequest(BaseModel):
 # Endpoints                                                           #
 # ------------------------------------------------------------------ #
 
+
+def _format_observation_response(obs):
+    payload = asdict(obs)
+    return {
+        "observation": payload,
+        "reward": payload["reward"],
+        "done": payload["done"],
+        **payload,
+    }
+
+
 @app.post("/reset")
-def reset(req: ResetRequest):
+def reset(req: ResetRequest | None = None):
     """Start a new episode. Returns initial observation."""
     global env
-    env = TowerDefenseEnvironment(difficulty=req.difficulty)
+    difficulty = req.difficulty if req is not None else "easy"
+    if difficulty not in {"easy", "medium", "hard"}:
+        raise HTTPException(
+            status_code=400,
+            detail="difficulty must be one of: easy, medium, hard",
+        )
+    env = TowerDefenseEnvironment(difficulty=difficulty)
     obs = env.reset()
-    return asdict(obs)
+    return _format_observation_response(obs)
 
 
 @app.post("/step")
-def step(req: StepRequest):
+def step(req: StepRequest | None = None):
     """
     Take one action.
     Returns observation with reward and done flag.
     """
+    if req is None:
+        req = StepRequest()
     action = TowerDefenseAction(
         place_tower=req.place_tower,
         row=req.row,
@@ -75,7 +94,7 @@ def step(req: StepRequest):
     )
     try:
         result = env.step(action)
-        return asdict(result)
+        return _format_observation_response(result)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 

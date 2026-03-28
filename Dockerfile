@@ -11,6 +11,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy source
 COPY src/ ./src/
+COPY inference.py ./
 
 # Set Python path so imports work
 ENV PYTHONPATH=/app/src

@@ -1,184 +1,218 @@
-"""
-Baseline inference entrypoint for the Tower Defense environment.
-
-This script provides:
-  - a reusable greedy policy via predict()/act()
-  - a local smoke test against the in-process environment
-  - optional HTTP mode against a running OpenEnv server
-"""
-
 from __future__ import annotations
 
 import argparse
 import json
-import sys
+import os
 from pathlib import Path
 from typing import Any
 
+from openai import OpenAI
+
+try:
+    from .models import SupportTriageAction, SupportTriageObservation
+    from .server.support_triage_environment import SupportTriageEnvironment
+except ImportError:
+    from models import SupportTriageAction, SupportTriageObservation
+    from server.support_triage_environment import SupportTriageEnvironment
+
 ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(ROOT / "src"))
+OUTPUT_PATH = ROOT / "outputs" / "evals" / "baseline_scores.json"
+SYSTEM_PROMPT = """
+You are a careful customer-support triage agent.
+Choose exactly one next action for the current queue state.
 
-import requests
+Rules:
+- Prefer the highest-risk unresolved ticket.
+- Use only the allowed structured values from the observation.
+- Ask for required missing information before closing privacy or identity escalations.
+- Output JSON only.
+""".strip()
 
-from envs.tower_defense.models import TowerDefenseAction, TowerDefenseObservation
-from envs.tower_defense.server.environment import TOWER_TYPES, TowerDefenseEnvironment
 
-VALID_DIFFICULTIES = ("easy", "medium", "hard")
-
-
-def _coerce_observation(payload: dict[str, Any] | TowerDefenseObservation) -> TowerDefenseObservation:
-    if isinstance(payload, TowerDefenseObservation):
-        return payload
-    return TowerDefenseObservation(
-        grid=payload.get("grid", []),
-        enemy_count=payload.get("enemy_count", 0),
-        base_hp=payload.get("base_hp", 100),
-        gold=payload.get("gold", 0),
-        wave_number=payload.get("wave_number", 1),
-        total_waves=payload.get("total_waves", 1),
-        enemies_killed_this_wave=payload.get("enemies_killed_this_wave", 0),
-        enemies_leaked_this_wave=payload.get("enemies_leaked_this_wave", 0),
-        legal_cells=payload.get("legal_cells", []),
-        done=payload.get("done", False),
-        reward=payload.get("reward", 0.0),
-        metadata=payload.get("metadata", {}),
+def next_heuristic_action(observation: SupportTriageObservation) -> SupportTriageAction:
+    queue = sorted(
+        [ticket for ticket in observation.queue if ticket.status != "resolved"],
+        key=lambda ticket: ticket.due_in_minutes,
     )
+    if not queue:
+        return SupportTriageAction(action_type="finish")
 
+    focus = queue[0]
+    if observation.selected_ticket_id != focus.ticket_id:
+        return SupportTriageAction(action_type="select_ticket", ticket_id=focus.ticket_id)
 
-def _allowed_towers(obs: TowerDefenseObservation, difficulty: str) -> list[str]:
-    if difficulty == "hard":
-        ordered = ["magic", "cannon", "arrow"]
-    elif difficulty == "medium":
-        ordered = ["cannon", "arrow"]
+    active = observation.active_ticket
+    if active is None:
+        return SupportTriageAction(action_type="select_ticket", ticket_id=focus.ticket_id)
+
+    text = f"{active.subject}\n{active.customer_message}\n{active.account_context}".lower()
+
+    if "charged twice" in text or "duplicate" in text:
+        target = {
+            "priority": "high",
+            "team": "billing",
+            "tags": ["refund_request", "duplicate_charge"],
+            "response_template": "billing_refund_approved",
+            "resolution": "approve_refund",
+            "required_info": [],
+        }
+    elif "okta" in text or "sso" in text or "sign in" in text:
+        target = {
+            "priority": "urgent",
+            "team": "identity",
+            "tags": ["sso", "login_blocker"],
+            "response_template": "identity_request_tenant_id",
+            "resolution": "escalate_identity",
+            "required_info": ["tenant_id"],
+        }
+    elif "vat invoice" in text or "invoice" in text:
+        target = {
+            "priority": "low",
+            "team": "billing",
+            "tags": ["invoice_request"],
+            "response_template": "invoice_followup",
+            "resolution": "provide_invoice",
+            "required_info": [],
+        }
+    elif "gdpr" in text or "deleted support transcript" in text or "former colleague" in text:
+        target = {
+            "priority": "high",
+            "team": "privacy_ops",
+            "tags": ["data_subject_request", "privacy", "gdpr"],
+            "response_template": "privacy_verification_required",
+            "resolution": "escalate_privacy",
+            "required_info": ["identity_verification"],
+        }
+    elif "harassment" in text or "threatening messages" in text:
+        target = {
+            "priority": "urgent",
+            "team": "trust_safety",
+            "tags": ["abuse_report", "harassment"],
+            "response_template": "safety_escalation_notice",
+            "resolution": "escalate_safety",
+            "required_info": [],
+        }
     else:
-        ordered = ["arrow"]
-    return [tower for tower in ordered if obs.gold >= TOWER_TYPES[tower]["cost"]]
+        target = {
+            "priority": "high",
+            "team": "billing",
+            "tags": ["service_outage", "refund_request"],
+            "response_template": "billing_credit_review",
+            "resolution": "offer_service_credit",
+            "required_info": [],
+        }
+
+    if "enterprise" in text and "enterprise" not in active.tags and "enterprise" in active.allowed_tags:
+        return SupportTriageAction(action_type="add_tag", tag="enterprise")
+    if "vip" in text and "vip" not in active.tags and "vip" in active.allowed_tags:
+        return SupportTriageAction(action_type="add_tag", tag="vip")
+    if active.priority != target["priority"]:
+        return SupportTriageAction(action_type="set_priority", priority=target["priority"])
+    if active.assigned_team != target["team"]:
+        return SupportTriageAction(action_type="assign_team", team=target["team"])
+    for tag in target["tags"]:
+        if tag in active.allowed_tags and tag not in active.tags:
+            return SupportTriageAction(action_type="add_tag", tag=tag)
+    for info_field in target["required_info"]:
+        if info_field not in active.requested_info:
+            return SupportTriageAction(action_type="request_info", info_field=info_field)
+    if active.response_template != target["response_template"]:
+        return SupportTriageAction(
+            action_type="send_response",
+            response_template=target["response_template"],
+        )
+    if active.resolution != target["resolution"]:
+        return SupportTriageAction(action_type="resolve", resolution=target["resolution"])
+    return SupportTriageAction(action_type="finish")
 
 
-def _coverage_score(obs: TowerDefenseObservation, row: int, col: int, tower_type: str) -> tuple[int, int]:
-    if not obs.grid:
-        return (0, 0)
-
-    size = int(len(obs.grid) ** 0.5)
-    tower_range = TOWER_TYPES[tower_type]["range"]
-    path_cells = 0
-    weighted_path_distance = 0
-
-    for index, cell in enumerate(obs.grid):
-        if cell != 1:
-            continue
-        path_row, path_col = divmod(index, size)
-        dist = abs(path_row - row) + abs(path_col - col)
-        if dist <= tower_range:
-            path_cells += 1
-            weighted_path_distance += max(0, tower_range - dist + 1)
-
-    return (path_cells, weighted_path_distance)
+def build_openai_client() -> OpenAI | None:
+    api_key = os.getenv("OPENAI_API_KEY") or os.getenv("HF_TOKEN")
+    base_url = os.getenv("API_BASE_URL")
+    if not api_key:
+        return None
+    return OpenAI(api_key=api_key, base_url=base_url or None)
 
 
-def choose_action(obs: dict[str, Any] | TowerDefenseObservation, difficulty: str = "easy") -> TowerDefenseAction:
-    observation = _coerce_observation(obs)
+def llm_action(client: OpenAI | None, observation: SupportTriageObservation) -> SupportTriageAction:
+    if client is None:
+        return next_heuristic_action(observation)
 
-    if observation.done or not observation.legal_cells:
-        return TowerDefenseAction(place_tower=False)
+    payload = observation.model_dump(mode="json")
+    user_prompt = json.dumps(payload, indent=2, sort_keys=True)
+    model_name = os.getenv("MODEL_NAME", "gpt-4.1-mini")
 
-    affordable = _allowed_towers(observation, difficulty)
-    if not affordable:
-        return TowerDefenseAction(place_tower=False)
-
-    best_choice: tuple[tuple[int, int, int, int], TowerDefenseAction] | None = None
-    for tower_type in affordable:
-        tower_cost = TOWER_TYPES[tower_type]["cost"]
-        tower_damage = TOWER_TYPES[tower_type]["damage"]
-        for row, col in observation.legal_cells:
-            coverage, weighted_distance = _coverage_score(observation, row, col, tower_type)
-            if coverage == 0:
-                continue
-            rank = (coverage, weighted_distance, tower_damage, -tower_cost)
-            action = TowerDefenseAction(
-                place_tower=True,
-                row=row,
-                col=col,
-                tower_type=tower_type,
-            )
-            if best_choice is None or rank > best_choice[0]:
-                best_choice = (rank, action)
-
-    if best_choice is None:
-        return TowerDefenseAction(place_tower=False)
-    return best_choice[1]
+    try:
+        completion = client.chat.completions.create(
+            model=model_name,
+            temperature=0,
+            max_tokens=250,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": (
+                        "Return a JSON object matching SupportTriageAction. Observation:\n"
+                        + user_prompt
+                    ),
+                },
+            ],
+        )
+        content = completion.choices[0].message.content or "{}"
+        return SupportTriageAction.model_validate_json(content)
+    except Exception:
+        return next_heuristic_action(observation)
 
 
-def predict(observation: dict[str, Any] | TowerDefenseObservation, difficulty: str = "easy") -> dict[str, Any]:
-    action = choose_action(observation, difficulty=difficulty)
+def run_episode(task_id: str, agent: str, client: OpenAI | None) -> dict[str, Any]:
+    env = SupportTriageEnvironment()
+    observation = env.reset(task_id=task_id)
+
+    while not observation.done:
+        action = llm_action(client, observation) if agent == "llm" else next_heuristic_action(observation)
+        observation = env.step(action)
+
+    state = env.state
     return {
-        "place_tower": action.place_tower,
-        "row": action.row,
-        "col": action.col,
-        "tower_type": action.tower_type,
+        "task_id": task_id,
+        "difficulty": state.difficulty,
+        "score": round(state.current_task_score, 4),
+        "cumulative_reward": round(state.cumulative_reward, 4),
+        "steps": state.step_count,
+        "tickets_completed": state.tickets_completed,
+        "total_tickets": state.total_tickets,
     }
 
 
-def act(observation: dict[str, Any] | TowerDefenseObservation, difficulty: str = "easy") -> dict[str, Any]:
-    return predict(observation, difficulty=difficulty)
-
-
-def run_local_episode(difficulty: str) -> dict[str, Any]:
-    env = TowerDefenseEnvironment(difficulty=difficulty)
-    obs = env.reset()
-
-    while not obs.done:
-        action = choose_action(obs, difficulty=difficulty)
-        obs = env.step(action)
-
-    return env.grade_episode()
-
-
-def run_http_episode(base_url: str, difficulty: str) -> dict[str, Any]:
-    reset_resp = requests.post(
-        f"{base_url.rstrip('/')}/reset",
-        json={"difficulty": difficulty},
-        timeout=15,
-    )
-    reset_resp.raise_for_status()
-    obs = reset_resp.json()
-
-    while not obs.get("done", False):
-        action = predict(obs, difficulty=difficulty)
-        step_resp = requests.post(
-            f"{base_url.rstrip('/')}/step",
-            json=action,
-            timeout=15,
-        )
-        step_resp.raise_for_status()
-        obs = step_resp.json()
-
-    grade_resp = requests.get(f"{base_url.rstrip('/')}/grade", timeout=15)
-    grade_resp.raise_for_status()
-    return grade_resp.json()
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run baseline Tower Defense inference.")
+    parser = argparse.ArgumentParser(description="Run baseline inference on support triage tasks.")
     parser.add_argument(
-        "--difficulty",
-        choices=VALID_DIFFICULTIES,
-        default="easy",
-        help="Episode difficulty to evaluate.",
-    )
-    parser.add_argument(
-        "--base-url",
-        default="",
-        help="Optional OpenEnv server URL. If omitted, run locally in-process.",
+        "--agent",
+        choices=["llm", "heuristic"],
+        default="llm",
+        help="Planner to use for the baseline run.",
     )
     args = parser.parse_args()
 
-    if args.base_url:
-        report = run_http_episode(args.base_url, args.difficulty)
-    else:
-        report = run_local_episode(args.difficulty)
+    client = build_openai_client() if args.agent == "llm" else None
+    results = [
+        run_episode(task_id, args.agent, client)
+        for task_id in SupportTriageEnvironment.available_tasks()
+    ]
+    average_score = round(sum(result["score"] for result in results) / len(results), 4)
 
-    print(json.dumps(report, indent=2, sort_keys=True))
+    summary = {
+        "agent": args.agent,
+        "model_name": os.getenv("MODEL_NAME", ""),
+        "api_base_url": os.getenv("API_BASE_URL", ""),
+        "results": results,
+        "average_score": average_score,
+    }
+
+    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    OUTPUT_PATH.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    print(json.dumps(summary, indent=2))
 
 
 if __name__ == "__main__":

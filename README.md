@@ -1,257 +1,205 @@
 ---
-title: Tower Defense RL Policy Showdown
-emoji: 🏰
+title: Support Triage OpenEnv
 colorFrom: blue
-colorTo: red
-sdk: gradio
-sdk_version: 4.0.0
-app_file: app.py
-python_version: 3.12
-pinned: false
+colorTo: green
+sdk: docker
+app_port: 8000
+license: mit
+tags:
+  - openenv
+  - fastapi
+  - customer-support
+  - reinforcement-learning
+python_version: "3.11"
 ---
 
-# Tower Defense RL Environment
+# Support Triage OpenEnv
 
-A mini-game RL environment built on the **OpenEnv framework**.
-An AI agent learns to place towers strategically to block waves of enemies.
+`Support Triage OpenEnv` is a real-world customer-support operations environment for training and evaluating agents on ticket triage, routing, escalation, and response planning.
 
----
+Instead of a toy game, the environment models work that actual support teams do every day:
 
-## Why This Meets The Rubric
+- assigning urgency under SLA pressure
+- routing work to the correct team
+- requesting missing information when needed
+- choosing safe customer responses
+- resolving or escalating tickets without violating policy
 
-- **Playable mini-game RL environment**: the agent manages gold, places towers, and defends the base against waves of enemies.
-- **Increasing difficulty**: `easy`, `medium`, and `hard` scale grid size, path count, wave count, enemy HP, and tower variety.
-- **Automated graders + reward logic**: kill rewards, leak penalties, wave-clear bonuses, and a final 0-100 score are built into the environment.
-- **OpenEnv-style packaging**: typed `Action`, `Observation`, and `State` models are exposed through `/reset`, `/step`, `/state`, `/grade`, and `/health`.
+The environment follows the OpenEnv pattern with typed action, observation, and state models, `reset()` / `step()` / `state()` APIs, a root `openenv.yaml`, a Docker deployment path for Hugging Face Spaces, and a baseline `inference.py`.
 
----
+## Why This Is Useful
 
-## 🧠 How the Agent Learns
+Support operations are a strong agent benchmark because the job is:
 
-### State Representation
-- **Grid**: Flattened 4x4 (easy), 6x6 (medium), 8x8 (hard) grid with values 0-4 (empty, path, arrow, cannon, magic towers)
-- **Base HP**: Current health of the base (starts at 100)
-- **Gold**: Available currency for placing towers
-- **Legal Cells**: Positions where towers can be placed (not on path)
+- multi-step rather than one-shot
+- partially observable because some fields are missing
+- safety-sensitive because wrong replies can create legal or trust issues
+- rewardable with deterministic graders instead of subjective free-form judging
 
-### Actions
-- **Place Tower**: Boolean (yes/no)
-- **Position**: Row and column (0-3 for easy)
-- **Tower Type**: Arrow (10 dmg, range 2, cost 50), Cannon (25 dmg, range 1, cost 100), Magic (15 dmg all in range, cost 150)
+This makes the environment useful for RL post-training, agent evaluation, tool-use experiments, and policy-abiding customer support research.
 
-### Reward Function
-- +10 per enemy killed
-- -5 per enemy reaching base (leak)
-- +20 wave cleared with 0 leaks
-- -1 per tower placed (efficiency)
-- +50-100 game won (scaled by remaining HP)
+## Tasks
 
-### RL Algorithm
-We demonstrate simple policies (Random, Greedy, Epsilon-Greedy) and provide code for PPO training using Stable-Baselines3.
+The environment ships with three deterministic tasks and difficulty progression:
 
-The Greedy policy places the best affordable tower at the position covering the most path cells within range.
+1. `support_easy`
+Billing refund triage for a duplicate annual-plan charge.
 
-Epsilon-Greedy starts random and becomes greedy over time, simulating learning.
+2. `support_medium`
+A two-ticket queue mixing an urgent enterprise SSO outage with a low-priority invoice request.
 
-For full RL training, see `train.py` and `gym_env.py`.
+3. `support_hard`
+A three-ticket mixed queue covering GDPR privacy escalation, trust-and-safety abuse handling, and outage credit review.
 
----
+Each task has a programmatic grader that returns a score in `[0.0, 1.0]` based on:
 
-## 📊 Results
+- correct priority
+- correct team routing
+- correct tags
+- required missing-info requests
+- correct response template
+- correct final resolution
 
-### Policy Performance (Easy Mode, 5 episodes avg)
-- 🎲 Random: 80.6/100
-- 🧠 Greedy Placer: 95.0/100
-- 📈 Epsilon-Greedy: 81.8/100
-- 🛑 Always Pass: 10.0/100
+## Action Space
 
-Greedy outperforms others by strategically placing towers to maximize coverage.
+`SupportTriageAction` is a typed Pydantic model with these operations:
 
-For harder difficulties, simple policies struggle due to increased complexity.
+- `select_ticket`
+- `set_priority`
+- `assign_team`
+- `add_tag`
+- `request_info`
+- `send_response`
+- `resolve`
+- `finish`
 
----
+Structured fields include:
 
-## ⚙️ Architecture Diagram
+- `ticket_id`
+- `priority`
+- `team`
+- `tag`
+- `info_field`
+- `response_template`
+- `resolution`
 
-```
-User → Gradio App → Policy/Episode Runner → Environment → Reward → Results
-```
+## Observation Space
 
-The environment runs locally without server for demo speed.
+`SupportTriageObservation` includes:
 
-For training: Agent → Gym Wrapper → Environment → Stable-Baselines3 PPO → Learned Policy
+- task metadata and goal
+- queue summary for every ticket
+- detailed view for the currently selected ticket
+- allowed priorities, teams, tags, templates, and resolutions
+- last action summary
+- current score estimate
+- typed reward breakdown in `reward_signal`
 
----
+The observation is designed so an agent can act step by step without direct access to the hidden rubric.
 
-## 🚀 Unique Twist: Adaptive Difficulty
+## Reward Design
 
-The demo includes 3 difficulty levels with increasing grid size, waves, and enemy HP, testing generalization.
+Reward is dense and shaped over the full trajectory:
 
-Policies are designed to adapt tower choice based on difficulty (e.g., more cannons on hard).
+- positive reward when an action increases the deterministic task score
+- small negative reward for redundant or invalid actions
+- completion bonus for fully resolved queues
+- timeout or early-finish penalties when unresolved work remains
 
----
+The environment score remains a clean `[0.0, 1.0]` grader, while the step reward gives useful learning signal throughout the episode.
 
-## Project Structure
-
-Recommended top-level files and folders:
+## Project Layout
 
 ```text
-src/                             OpenEnv-style environment code
-tests/test_environment.py        Runtime, interface, task, and grader checks
-demo.py                          Policy showdown runner
-app.py                           Gradio demo entrypoint
-requirements.txt                 Python dependencies
+.
+|-- __init__.py
+|-- client.py
+|-- models.py
+|-- inference.py
+|-- openenv.yaml
+|-- pyproject.toml
+|-- requirements.txt
+|-- Dockerfile
+`-- server/
+    |-- app.py
+    |-- support_triage_environment.py
+    |-- requirements.txt
+    `-- Dockerfile
 ```
 
-```
-tower_defense_env/
-├── src/
-│   ├── core/                          ← OpenEnv standard base classes
-│   │   ├── env_server.py              ← Action, Observation, State ABCs
-│   │   └── http_env_client.py         ← HTTPEnvClient base class
-│   └── envs/tower_defense/
-│       ├── models.py                  ← Type-safe contracts
-│       ├── client.py                  ← HTTP client (import in training)
-│       └── server/
-│           ├── environment.py         ← Game logic + grader
-│           └── app.py                 ← FastAPI server
-├── tests/
-│   └── test_environment.py            ← Full test suite
-├── demo.py                            ← 4-policy showdown demo
-├── Dockerfile
-└── requirements.txt
-```
+## Local Setup
 
----
-
-## Quick Start
-
-Recommended local workflow from the repo root:
+Install dependencies:
 
 ```bash
 pip install -r requirements.txt
-python app.py
-python tests/test_environment.py
 ```
 
-### Option A — Run directly (no Docker)
+Run the environment locally:
 
 ```bash
-# Install project dependencies
-pip install -r requirements.txt
-
-# Start the server
-uvicorn envs.tower_defense.server.app:app --host 0.0.0.0 --port 8000 --app-dir src
-
-# Run the demo (new terminal)
-python demo.py
-
-# Run the tests
-python tests/test_environment.py
+uvicorn server.app:app --host 0.0.0.0 --port 8000
 ```
 
-### Option B — Docker
+Run OpenEnv validation:
 
 ```bash
-docker build -t tower-defense-env .
-docker run -p 8000:8000 -e TD_DIFFICULTY=medium tower-defense-env
+openenv validate .
 ```
 
----
+Build the container:
 
-## The Game
-
-```
-4x4 grid (easy mode):
-
-  0 1 2 3
-0 · · · ·
-1 A ─ ─ ─   A = Arrow tower placed by agent
-2 · · · ·   ─ = Enemy path
-3 · · · ·
-
-Legend:  ·=empty  ─=path  A=arrow  C=cannon  M=magic
+```bash
+docker build -t support-triage-openenv .
+docker run -p 8000:8000 support-triage-openenv
 ```
 
-### Difficulty Levels
+## Hugging Face Spaces
 
-| Level  | Grid | Waves | Paths | Tower Types | Enemy HP |
-|--------|------|-------|-------|-------------|----------|
-| Easy   | 4×4  | 3     | 1     | Arrow only  | 30       |
-| Medium | 6×6  | 5     | 2     | Arrow+Cannon| 50       |
-| Hard   | 8×8  | 10    | 3     | All 3 types | 80       |
+This repo is configured for a Docker Space.
 
-### Tower Types
+Required HF metadata is set in the README frontmatter:
 
-| Tower  | Damage | Range | Cost | Notes                  |
-|--------|--------|-------|------|------------------------|
-| Arrow  | 10     | 2     | 50g  | Single target, basic   |
-| Cannon | 25     | 1     | 100g | High damage, short rng |
-| Magic  | 15     | 3     | 150g | Hits ALL in range      |
+- `sdk: docker`
+- `app_port: 8000`
+- `tags: [openenv, ...]`
 
----
+The Space should expose the FastAPI/OpenEnv app served by `uvicorn server.app:app`.
 
-## Reward Logic (Grader)
+## Baseline Inference
 
-```
-+10   per enemy killed           ← task completion
- -5   per enemy reaching base    ← failure penalty
-+20   wave cleared with 0 leaks  ← perfect play bonus
- -1   per tower placed           ← efficiency pressure
-+50–100  game won                ← scaled by HP remaining
+The root `inference.py` supports two modes:
+
+- `llm`: OpenAI-compatible planner using `OPENAI_API_KEY` or `HF_TOKEN`, `API_BASE_URL`, and `MODEL_NAME`
+- `heuristic`: deterministic fallback for offline smoke tests
+
+Example:
+
+```bash
+python inference.py --agent heuristic
+python inference.py --agent llm
 ```
 
-**Why this makes sense for RL:**
-- Sparse reward problem: towers placed now pay off several steps later
-- Efficiency bonus discourages brute-force placement
-- HP-scaled win bonus rewards careful play, not just barely surviving
+Environment variables expected by the LLM baseline:
 
----
+- `OPENAI_API_KEY`
+- `API_BASE_URL`
+- `MODEL_NAME`
+- `HF_TOKEN` as an optional fallback API token
 
-## API Reference (OpenEnv Standard)
+## Reproducible Baseline Scores
 
-```
-POST /reset    {"difficulty": "easy"}          → initial observation
-POST /step     {"place_tower": true,            → observation + reward
-                "row": 1, "col": 2,
-                "tower_type": "arrow"}
-GET  /state                                     → episode metadata
-GET  /grade                                     → automated score report
-GET  /health                                    → liveness check
-```
+Deterministic heuristic baseline:
 
----
+- `support_easy`: `1.000`
+- `support_medium`: `1.000`
+- `support_hard`: `0.985`
+- average: `0.995`
 
-## Usage in Training Code
+Exact LLM-backed scores depend on the chosen model, but the script uses `temperature=0` and a constrained JSON action format for stable behavior.
 
-```python
-from envs.tower_defense.client import TowerDefenseEnv
-from envs.tower_defense.models import TowerDefenseAction
+## Notes
 
-env = TowerDefenseEnv(base_url="http://localhost:8000")
-result = env.reset(difficulty="medium")
-
-while not result.done:
-    # Your policy here
-    action = TowerDefenseAction(
-        place_tower=True,
-        row=2, col=3,
-        tower_type="cannon"
-    )
-    result = env.step(action)
-    print(f"Reward: {result.reward}  Base HP: {result.observation.base_hp}")
-
-report = env.grade()
-print(f"Final score: {report['score']}/100")
-```
-
----
-
-## Evaluation Criteria Compliance
-
-| Criterion         | How it's met                                              |
-|-------------------|-----------------------------------------------------------|
-| Runtime correct   | Full test suite passes (run `tests/test_environment.py`)  |
-| Interface standard| Inherits `HTTPEnvClient`, `Action`, `Observation`, `State`|
-| Task design       | 3 clear difficulty levels, testable win/loss conditions   |
-| Grading logic     | `grade_episode()` returns score 0-100 with full breakdown |
+- The grader is deterministic by construction.
+- Hidden rubric fields are not exposed directly in the observation.
+- The environment stays within small CPU and memory limits and does not require external services to run.

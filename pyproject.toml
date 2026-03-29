@@ -18,6 +18,9 @@ dependencies = [
     "pydantic>=2.8.0",
 ]
 
+[project.scripts]
+server = "server.app:main"
+
 [tool.setuptools]
 py-modules = ["client", "models"]
 
